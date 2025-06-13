@@ -16,6 +16,7 @@ import os
 import sys
 from transformers import ViTModel, ViTImageProcessor
 from einops import rearrange
+import cv2
 
 # 親ディレクトリをパスに追加
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,7 +65,9 @@ class ViTFeatureExtractor:
             attention_maps: 注意マップ（オプション）
         """
         img = Image.open(image_path).convert('RGB')
-        inputs = self.processor(images=img, return_tensors="pt").to(self.device)
+        # モデルの入力用にリサイズ
+        img_resized = img.resize((224, 224))
+        inputs = self.processor(images=img_resized, return_tensors="pt").to(self.device)
         
         with torch.no_grad():
             outputs = self.model(**inputs, output_attentions=return_attention)
@@ -153,6 +156,72 @@ class ViTFeatureExtractor:
         
         return fig
 
+    def visualize_attention_overlay(self, image_path, attention_maps, layer_idx=-1, head_idx=0, alpha=0.5):
+        """
+        注意マップを元画像に重ね合わせて可視化する
+        
+        Args:
+            image_path: 元画像のパス
+            attention_maps: モデルから抽出された注意マップ
+            layer_idx: 可視化するレイヤーのインデックス
+            head_idx: 可視化するアテンションヘッドのインデックス
+            alpha: オーバーレイの透明度（0-1）
+        """
+        # 画像の読み込み
+        img = Image.open(image_path).convert('RGB')
+        original_size = img.size
+        img_np = np.array(img)
+        
+        # 注意マップの取得
+        attn = attention_maps[layer_idx][0, head_idx].cpu().numpy()
+        cls_attn = attn[0, 1:]  # CLS token -> patches
+        
+        # 画像グリッドに変換
+        grid_size = int(np.sqrt(len(cls_attn)))
+        cls_attn = cls_attn.reshape(grid_size, grid_size)
+        
+        # 注意マップの正規化（より明確なコントラストのために）
+        cls_attn = (cls_attn - cls_attn.min()) / (cls_attn.max() - cls_attn.min() + 1e-8)
+        
+        # 注意マップを元画像サイズにリサイズ
+        attention_resized = cv2.resize(cls_attn, original_size)
+        
+        # 注意マップをカラーマップに変換（より鮮明な色を使用）
+        attention_colored = cv2.applyColorMap(
+            (attention_resized * 255).astype(np.uint8),
+            cv2.COLORMAP_JET  # VIRIDISからJETに変更
+        )
+        
+        # BGRからRGBに変換
+        attention_colored = cv2.cvtColor(attention_colored, cv2.COLOR_BGR2RGB)
+        
+        # オーバーレイ画像の作成（より強いコントラストのために）
+        overlay = cv2.addWeighted(img_np, 1-alpha, attention_colored, alpha, 0)
+        
+        # 可視化
+        fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+        
+        axes[0].imshow(img_np)
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        axes[1].imshow(attention_colored)
+        axes[1].set_title(f'Attention Map (Layer {layer_idx+1}, Head {head_idx+1})')
+        axes[1].axis('off')
+        
+        axes[2].imshow(overlay)
+        axes[2].set_title('Overlay')
+        axes[2].axis('off')
+        
+        # カラーバーの追加
+        norm = plt.Normalize(0, 1)
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.jet, norm=norm)
+        sm.set_array([])
+        plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        plt.tight_layout()
+        return fig
+
 
 def process_high_resolution_image(image_path, output_dir='outputs'):
     """
@@ -177,10 +246,17 @@ def process_high_resolution_image(image_path, output_dir='outputs'):
     # 特徴の可視化と保存
     feature_fig = extractor.visualize_features(features)
     feature_fig.savefig(f"{output_dir}/{img_name}_vit_features.png")
+    plt.close(feature_fig)
     
     # 注意マップの可視化と保存（最後のレイヤーの最初のヘッド）
     attention_fig = extractor.visualize_attention(image_path, attention_maps)
     attention_fig.savefig(f"{output_dir}/{img_name}_vit_attention.png")
+    plt.close(attention_fig)
+    
+    # オーバーレイ可視化の保存
+    overlay_fig = extractor.visualize_attention_overlay(image_path, attention_maps)
+    overlay_fig.savefig(f"{output_dir}/{img_name}_vit_attention_overlay.png")
+    plt.close(overlay_fig)
     
     # 複数の注意ヘッドを可視化
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -205,6 +281,7 @@ def process_high_resolution_image(image_path, output_dir='outputs'):
     
     plt.tight_layout()
     fig.savefig(f"{output_dir}/{img_name}_vit_multi_attention.png")
+    plt.close(fig)
     
     print(f"ViT特徴抽出と可視化が完了しました。結果は{output_dir}ディレクトリに保存されています。")
     return features
